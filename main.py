@@ -17,6 +17,7 @@ import random
 import re
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import textwrap
@@ -40,6 +41,13 @@ CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID", "")
+YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET", "")
+YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN", "")
+YT_PRIVACY = os.environ.get("YT_PRIVACY", "private") or "private"
+TT_CLIENT_KEY = os.environ.get("TT_CLIENT_KEY", "")
+TT_CLIENT_SECRET = os.environ.get("TT_CLIENT_SECRET", "")
+TT_REFRESH_TOKEN = os.environ.get("TT_REFRESH_TOKEN", "")
 
 GAME_NAME = os.environ.get("GAME_NAME", "Grand Theft Auto VI")
 LANGUAGE = os.environ.get("STREAM_LANGUAGE", "fr")
@@ -53,6 +61,10 @@ WINDOW = 8                                    # fenetre "recente" du chat (s)
 BASE_WINDOW = 180                             # fenetre de reference (s)
 MIN_MSGS = _i("MIN_MSGS", 15)                 # messages min dans la fenetre
 RATIO = _f("RATIO", 3.0)                      # pic = X fois le niveau normal
+AUDIO_DB = _f("AUDIO_DB", 6.0)                # saut de volume (dB) = moment fort
+VIS_RATIO = _f("VIS_RATIO", 2.0)              # activite a l'ecran x fois la normale
+VIS_MIN = _f("VIS_MIN", 0.05)                 # activite visuelle minimale
+CROP_X = _f("CROP_X", 0.5)                    # cadrage vertical : 0 gauche, 0.5 centre, 1 droite
 COOLDOWN = _i("COOLDOWN", 240)                # pause par streamer (s)
 MAX_CLIPS_PER_RUN = _i("MAX_CLIPS_PER_RUN", 12)
 REFRESH = _i("REFRESH", 120)                  # rafraichit la liste des lives
@@ -66,17 +78,30 @@ ROOT = os.path.abspath("work")
 BUF_DIR = os.path.join(ROOT, "buffers")
 JOB_DIR = os.path.join(ROOT, "jobs")
 
-TITLES = [
-    "{n} vit un moment INCROYABLE sur GTA 6",
-    "Personne n'etait pret pour ca sur GTA 6",
-    "{n} n'en revient pas sur GTA 6",
-    "Ce moment sur GTA 6 est completement fou",
-    "GTA 6 : {n} vient de tout casser",
-    "Mais qu'est-ce qui vient de se passer sur GTA 6 ?!",
-    "Le moment le plus fou de GTA 6 pour l'instant",
-]
+TITLES = {
+    "audio": [
+        "{n} hurle sur GTA 6, ca part en vrille",
+        "Le cri de {n} sur GTA 6 est legendaire",
+        "{n} perd completement le controle sur GTA 6",
+    ],
+    "chat": [
+        "Le chat de {n} explose sur GTA 6",
+        "Tout le chat de {n} devient fou sur GTA 6",
+        "{n} met le feu au chat sur GTA 6",
+    ],
+    "action": [
+        "Cette scene sur GTA 6 est completement folle",
+        "Personne n'etait pret pour ca sur GTA 6",
+        "Mais qu'est-ce qui vient de se passer sur GTA 6 ?!",
+    ],
+    "generic": [
+        "{n} vit un moment INCROYABLE sur GTA 6",
+        "GTA 6 : {n} vient de tout casser",
+        "Attends la fin, c'est dingue sur GTA 6",
+    ],
+}
 EMOJIS = ["🔥", "😱", "🤯", "😂", "💀"]
-HASHTAGS = "#GTA6 #GTAVI #Shorts #Gaming #Twitch #GTA #Clips"
+HASHTAGS = "#GTA6 #GTAVI #Shorts #Gaming #JeuxVideo #Twitch #GTA #Clips"
 
 
 def log(*a):
@@ -144,6 +169,136 @@ def tg_video(path, caption):
         return ok
     except Exception as e:
         log("telegram: video en erreur", type(e).__name__)
+        return False
+
+
+# ------------------------------------------------------------------ youtube
+def yt_enabled():
+    return bool(YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN)
+
+
+def yt_upload(path, title, description):
+    """Depose le clip sur ta chaine. 'private' tant que l'audit YouTube n'est pas passe."""
+    try:
+        t = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": YT_CLIENT_ID,
+                "client_secret": YT_CLIENT_SECRET,
+                "refresh_token": YT_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        t.raise_for_status()
+        access = t.json()["access_token"]
+        meta = {
+            "snippet": {
+                "title": title[:95],
+                "description": description[:4900],
+                "tags": ["GTA6", "GTAVI", "Shorts", "Gaming"],
+                "categoryId": "20",
+            },
+            "status": {
+                "privacyStatus": YT_PRIVACY,
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+        size = os.path.getsize(path)
+        init = requests.post(
+            "https://www.googleapis.com/upload/youtube/v3/videos"
+            "?uploadType=resumable&part=snippet,status",
+            headers={
+                "Authorization": "Bearer " + access,
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Length": str(size),
+                "X-Upload-Content-Type": "video/mp4",
+            },
+            json=meta,
+            timeout=60,
+        )
+        init.raise_for_status()
+        with open(path, "rb") as f:
+            up = requests.put(
+                init.headers["Location"],
+                data=f,
+                headers={"Content-Length": str(size), "Content-Type": "video/mp4"},
+                timeout=900,
+            )
+        up.raise_for_status()
+        return "https://youtube.com/shorts/" + up.json()["id"]
+    except requests.HTTPError as e:
+        log("youtube: erreur", e.response.status_code, e.response.text[:200])
+    except Exception as e:
+        log("youtube: erreur", type(e).__name__)
+    return None
+
+
+# ------------------------------------------------------------------- tiktok
+_tt = {"tok": "", "exp": 0}
+
+
+def tt_enabled():
+    return bool(TT_CLIENT_KEY and TT_CLIENT_SECRET and TT_REFRESH_TOKEN)
+
+
+def tt_token():
+    if _tt["tok"] and time.time() < _tt["exp"]:
+        return _tt["tok"]
+    r = requests.post(
+        "https://open.tiktokapis.com/v2/oauth/token/",
+        data={
+            "client_key": TT_CLIENT_KEY,
+            "client_secret": TT_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": TT_REFRESH_TOKEN,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    j = r.json()
+    if "access_token" not in j:
+        raise RuntimeError("token tiktok refuse: " + str(j.get("error", "?")))
+    _tt["tok"] = j["access_token"]
+    _tt["exp"] = time.time() + int(j.get("expires_in", 86400)) - 600
+    if j.get("refresh_token") and j["refresh_token"] != TT_REFRESH_TOKEN:
+        log("tiktok: le refresh token a change, a renouveler dans les secrets")
+    return _tt["tok"]
+
+
+def tt_upload(path):
+    """Envoie le clip dans ta boite de reception TikTok (brouillon a finir dans l'appli)."""
+    try:
+        tok = tt_token()
+        size = os.path.getsize(path)
+        h = {"Authorization": "Bearer " + tok,
+             "Content-Type": "application/json; charset=UTF-8"}
+        init = requests.post(
+            "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+            headers=h,
+            json={"source_info": {"source": "FILE_UPLOAD", "video_size": size,
+                                  "chunk_size": size, "total_chunk_count": 1}},
+            timeout=60,
+        ).json()
+        data = init.get("data") or {}
+        if not data.get("upload_url"):
+            log("tiktok: init refuse", (init.get("error") or {}).get("code"))
+            return False
+        with open(path, "rb") as f:
+            up = requests.put(
+                data["upload_url"],
+                data=f,
+                headers={"Content-Range": f"bytes 0-{size - 1}/{size}",
+                         "Content-Type": "video/mp4",
+                         "Content-Length": str(size)},
+                timeout=600,
+            )
+        if up.status_code not in (200, 201):
+            log("tiktok: upload refuse", up.status_code)
+            return False
+        return True
+    except Exception as e:
+        log("tiktok: erreur", type(e).__name__, str(e)[:120] if isinstance(e, RuntimeError) else "")
         return False
 
 
@@ -279,6 +434,8 @@ class Recorder(threading.Thread):
         self.dir = os.path.join(BUF_DIR, login)
         self.stop_evt = threading.Event()
         self.procs = []
+        self.metrics = deque(maxlen=60)   # (volume moyen dB, activite visuelle) par segment
+        self.analyzed = set()
 
     def stop(self):
         self.stop_evt.set()
@@ -302,12 +459,56 @@ class Recorder(threading.Thread):
         return len(self._segments())
 
     def ready(self):
-        return self.count() >= 14   # ~ 56 s de cache minimum
+        return self.count() >= 16   # ~ 64 s de cache minimum
+
+    # -- analyse du son et de l'image
+    @staticmethod
+    def analyze_segment(path):
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+             "-vf", "fps=4,scale=160:90,select='gte(scene,0)',metadata=print:file=-",
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", r.stderr)
+        vol = float(m.group(1)) if m else -91.0
+        sc = [float(x) for x in re.findall(r"scene_score=([\d.]+)", r.stdout)]
+        motion = sum(sc) / len(sc) if sc else 0.0
+        return vol, motion
+
+    def _analyze_loop(self):
+        while not self.stop_evt.is_set():
+            try:
+                done = self._segments()[:-1]      # le dernier est en cours d'ecriture
+                for f in done[-4:]:
+                    if f not in self.analyzed:
+                        self.analyzed.add(f)
+                        self.metrics.append(self.analyze_segment(f))
+                if len(self.analyzed) > 200:
+                    self.analyzed = set(done)
+            except Exception as e:
+                log("analyse:", self.login, type(e).__name__)
+            time.sleep(1)
+
+    def signals(self):
+        """(saut de volume en dB, rapport d'activite visuelle, activite recente)"""
+        m = list(self.metrics)
+        if len(m) < 8:
+            return None, None, 0.0
+        recent, base = m[-2:], m[-32:-2]
+        vol_r = sum(x[0] for x in recent) / len(recent)
+        vol_b = statistics.median(x[0] for x in base)
+        mot_r = sum(x[1] for x in recent) / len(recent)
+        mot_b = statistics.median(x[1] for x in base)
+        return vol_r - vol_b, mot_r / max(mot_b, 0.02), mot_r
 
     def run(self):
+        threading.Thread(target=self._analyze_loop, daemon=True).start()
         while not self.stop_evt.is_set():
             shutil.rmtree(self.dir, ignore_errors=True)
             os.makedirs(self.dir, exist_ok=True)
+            self.metrics.clear()
+            self.analyzed = set()
             try:
                 sl = subprocess.Popen(
                     [
@@ -349,7 +550,7 @@ class Recorder(threading.Thread):
         """Copie immediatement les derniers `seconds` secondes du cache."""
         files = self._segments()[:-1]            # le dernier est en cours d'ecriture
         files = files[-math.ceil(seconds / SEG_LEN):]
-        if len(files) < 11:
+        if len(files) < 15:                      # au moins ~60 s
             return None
         jobdir = os.path.join(JOB_DIR, f"{self.login}_{int(time.time())}")
         os.makedirs(jobdir, exist_ok=True)
@@ -419,8 +620,16 @@ def clean_name(n):
     return re.sub(r"[^\w\- ]", "", n)[:20].strip() or "Ce streamer"
 
 
-def make_title(display):
-    base = random.choice(TITLES).format(n=clean_name(display))
+def make_title(display, reasons=()):
+    if "audio" in reasons:
+        kind = "audio"
+    elif "chat" in reasons:
+        kind = "chat"
+    elif "visuel" in reasons:
+        kind = "action"
+    else:
+        kind = "generic"
+    base = random.choice(TITLES[kind]).format(n=clean_name(display))
     return base, f"{random.choice(EMOJIS)} {base}"
 
 
@@ -428,31 +637,47 @@ def render(jobdir, screen_title, with_subs):
     with open(os.path.join(jobdir, "title.txt"), "w", encoding="utf-8") as f:
         f.write(textwrap.fill(screen_title.upper(), 20))
 
+    try:
+        dur = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", "raw.ts"],
+            cwd=jobdir, capture_output=True, text=True, timeout=30,
+        ).stdout.strip())
+    except Exception:
+        dur = float(CLIP_SECONDS)
+    dur = max(dur, 5.0)
+
     subs = ""
     if with_subs:
         subs = (
             ",subtitles=clip.srt:original_size=1080x1920:"
             "fontsdir=/usr/share/fonts/truetype/dejavu:force_style="
-            "'FontName=DejaVu Sans,FontSize=9,Bold=1,Outline=1.2,Alignment=2,MarginV=60'"
+            "'FontName=DejaVu Sans,FontSize=9,Bold=1,Outline=1.2,Alignment=2,"
+            "MarginV=60,PrimaryColour=&H0000FFFF'"
         )
 
+    # plein cadre : on decoupe la partie centrale de l'image en 9:16 et on zoome
     fg = (
-        "[0:v]setpts=PTS-STARTPTS,split=2[bg][fg];"
-        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,boxblur=25:3[bgb];"
-        "[fg]scale=1080:-2[fgs];"
-        "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps=30,setsar=1,"
-        f"drawtext=fontfile={FONT}:textfile=title.txt:expansion=none:fontsize=68:"
-        "fontcolor=white:borderw=5:bordercolor=black:line_spacing=12:"
-        "x=(w-text_w)/2:y=260:enable='between(t,0,4)'"
-        f"{subs},format=yuv420p[v0];"
-        "[1:v]drawbox=x=190:y=1030:w=700:h=170:color=0xFF0000@0.95:t=fill,"
-        f"drawtext=fontfile={FONT}:text=ABONNE-TOI:fontsize=84:fontcolor=white:"
-        "x=(w-text_w)/2:y=1075+10*sin(2*PI*t*3),"
-        f"drawtext=fontfile={FONT}:text=pour plus de clips GTA 6:fontsize=56:"
-        "fontcolor=white:x=(w-text_w)/2:y=1320:alpha='0.6+0.4*sin(2*PI*t*2)',"
+        "[0:v]setpts=PTS-STARTPTS,"
+        f"crop=w='min(iw,ih*9/16)':h=ih:x='(iw-ow)*{CROP_X}':y=0,"
+        "scale=1080:1920:flags=lanczos,fps=30,setsar=1,"
+        f"drawtext=fontfile={FONT}:textfile=title.txt:expansion=none:fontsize=70:"
+        "fontcolor=yellow:borderw=5:bordercolor=black:line_spacing=12:"
+        "box=1:boxcolor=black@0.45:boxborderw=22:"
+        "x=(w-text_w)/2:y=230:enable='between(t,0,4)'"
+        f"{subs},format=yuv420p[v0a];"
+        # barre de progression jaune en bas (retient l'attention)
+        "[v0a][3:v]overlay=x='-w+w*t/" + f"{dur:.2f}" + "':y=H-16:shortest=1[v0];"
+        "[1:v]drawbox=x=150:y=980:w=780:h=170:color=0xFF0000@0.95:t=fill,"
+        f"drawtext=fontfile={FONT}:text=ABONNE-TOI:fontsize=86:fontcolor=white:"
+        "x=(w-text_w)/2:y=1025+10*sin(2*PI*t*3),"
+        f"drawtext=fontfile={FONT}:text=pour ne rater aucun des moments:fontsize=50:"
+        "fontcolor=white:x=(w-text_w)/2:y=1260:alpha='0.7+0.3*sin(2*PI*t*2)',"
+        f"drawtext=fontfile={FONT}:text=les plus fous du jeu vidéo:fontsize=50:"
+        "fontcolor=yellow:x=(w-text_w)/2:y=1335:alpha='0.7+0.3*sin(2*PI*t*2)',"
         "fade=t=in:st=0:d=0.4,fps=30,setsar=1,format=yuv420p[v1];"
-        "[0:a]asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=stereo[a0];"
+        "[0:a]asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-1.5:LRA=11,"
+        "aresample=44100,aformat=channel_layouts=stereo[a0];"
         "[2:a]aformat=channel_layouts=stereo[a1];"
         "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
     )
@@ -461,6 +686,7 @@ def render(jobdir, screen_title, with_subs):
         "-i", "raw.ts",
         "-f", "lavfi", "-t", "3", "-i", "color=c=0x14141e:s=1080x1920:r=30",
         "-f", "lavfi", "-t", "3", "-i", "anullsrc=r=44100:cl=stereo",
+        "-f", "lavfi", "-t", f"{dur + 1:.2f}", "-i", "color=c=yellow:s=1080x14:r=30",
         "-filter_complex", fg,
         "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
@@ -473,8 +699,8 @@ def render(jobdir, screen_title, with_subs):
     return os.path.join(jobdir, "final.mp4")
 
 
-def process(jobdir, login, display):
-    screen_title, caption_title = make_title(display)
+def process(jobdir, login, display, reasons=()):
+    screen_title, caption_title = make_title(display, reasons)
     with_subs = ENABLE_SUBS and make_subs(jobdir)
     try:
         out = render(jobdir, screen_title, with_subs)
@@ -486,10 +712,23 @@ def process(jobdir, login, display):
     caption = (
         f"{caption_title}\n\n"
         f"Clip du live de {display} (twitch.tv/{login}). "
-        f"Abonne-toi pour plus de moments GTA 6 !\n\n{HASHTAGS}"
+        f"Abonne-toi pour ne rater aucun des moments les plus fous du jeu vidéo !\n\n{HASHTAGS}"
     )
     ok = tg_video(out, caption)
     log("clip envoye" if ok else "clip NON envoye", login)
+    if yt_enabled():
+        link = yt_upload(out, f"{caption_title} #Shorts", caption)
+        if link:
+            log("youtube: depose", YT_PRIVACY)
+            tg_text(f"▶️ YouTube ({YT_PRIVACY}) : {link}")
+        else:
+            tg_text("⚠️ Dépôt YouTube échoué, voir les logs GitHub.")
+    if tt_enabled():
+        if tt_upload(out):
+            log("tiktok: brouillon envoye")
+            tg_text("🎵 TikTok : brouillon dans ta boîte de réception TikTok (légende dans le message ci-dessus).")
+        else:
+            tg_text("⚠️ Envoi TikTok échoué, voir les logs GitHub.")
 
 
 # -------------------------------------------------------------- orchestrateur
@@ -528,15 +767,26 @@ class App:
             return
         if now - self.first_seen.get(login, now) < 90:
             return
-        if recent < MIN_MSGS or recent / WINDOW < RATIO * max(base_rate, 0.3):
-            return
         if now - self.last_clip.get(login, 0) < COOLDOWN:
             return
         if self.clips >= MAX_CLIPS_PER_RUN or self.jobs.qsize() >= 25:
             return
+        aj, vr, mot = rec.signals()
+        chat_hit = recent >= MIN_MSGS and recent / WINDOW >= RATIO * max(base_rate, 0.3)
+        audio_hit = aj is not None and aj >= AUDIO_DB
+        visual_hit = vr is not None and vr >= VIS_RATIO and mot >= VIS_MIN
+        score = chat_hit + audio_hit + visual_hit
+        strong = (chat_hit and recent >= 2.5 * MIN_MSGS) or (aj is not None and aj >= AUDIO_DB + 6)
+        if score < 2 and not strong:
+            return
+        reasons = [n for n, hit in (("chat", chat_hit), ("audio", audio_hit), ("visuel", visual_hit)) if hit]
         self.last_clip[login] = now
-        log(f"PIC detecte sur {login}: {recent} msgs/{WINDOW}s (normal {base_rate:.2f}/s)")
-        threading.Timer(POST_DELAY, self.grab, args=(login,)).start()
+        log(
+            f"PIC detecte sur {login} ({'+'.join(reasons) or 'fort'}): chat {recent}/{WINDOW}s "
+            f"(normal {base_rate:.2f}/s), son {aj if aj is None else round(aj, 1)} dB, "
+            f"image x{vr if vr is None else round(vr, 1)}"
+        )
+        threading.Timer(POST_DELAY, self.grab, args=(login, reasons)).start()
 
     def detector(self):
         while not self.stop.is_set():
@@ -547,7 +797,7 @@ class App:
                     log("detecteur:", type(e).__name__)
             time.sleep(1)
 
-    def grab(self, login):
+    def grab(self, login, reasons=()):
         rec = self.recorders.get(login)
         if not rec:
             return
@@ -557,7 +807,7 @@ class App:
             return
         display = self.info.get(login, (login, 0))[0]
         try:
-            self.jobs.put_nowait((jobdir, login, display))
+            self.jobs.put_nowait((jobdir, login, display, list(reasons)))
             self.clips += 1
             log(f"clip #{self.clips} en file d'attente ({self.jobs.qsize()} en attente)")
         except queue.Full:
@@ -569,18 +819,20 @@ class App:
         for login, rec in list(self.recorders.items()):
             with self.lock:
                 n = sum(1 for t in self.stamps.get(login, ()) if t >= now - 60)
-            parts.append(f"{login} cache={rec.count()}seg chat={n}/60s")
+            aj, vr, _ = rec.signals()
+            sig = "" if aj is None else f" son{aj:+.1f}dB image x{vr:.1f}"
+            parts.append(f"{login} cache={rec.count()}seg chat={n}/60s{sig}")
         log("ETAT:", " | ".join(parts) if parts else "aucun stream", f"| clips={self.clips}")
 
     # -- file d'attente
     def worker(self):
         while not (self.stop.is_set() and self.jobs.empty()):
             try:
-                jobdir, login, display = self.jobs.get(timeout=2)
+                jobdir, login, display, reasons = self.jobs.get(timeout=2)
             except queue.Empty:
                 continue
             try:
-                process(jobdir, login, display)
+                process(jobdir, login, display, reasons)
             except Exception as e:
                 log("montage en erreur:", type(e).__name__)
             finally:
