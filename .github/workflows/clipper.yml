@@ -1,8 +1,11 @@
 name: GTA6 Clipper
 on:
+  push:
+    paths: ["main.py", ".github/workflows/clipper.yml"]
   schedule:
     - cron: "0 5,11,17,23 * * *"
   workflow_dispatch:
+
 concurrency:
   group: clipper
   cancel-in-progress: false
