@@ -247,6 +247,7 @@ class Chat(threading.Thread):
             try:
                 s = socket.create_connection(("irc.chat.twitch.tv", 6667), timeout=10)
                 s.settimeout(1.0)
+                log("chat: connecte")
                 s.sendall(
                     b"PASS SCHMOOPIIE\r\nNICK justinfan%d\r\n"
                     % random.randint(10000, 99999)
@@ -297,8 +298,11 @@ class Recorder(threading.Thread):
             except OSError:
                 pass
 
+    def count(self):
+        return len(self._segments())
+
     def ready(self):
-        return len(self._segments()) >= 14   # ~ 56 s de cache minimum
+        return self.count() >= 14   # ~ 56 s de cache minimum
 
     def run(self):
         while not self.stop_evt.is_set():
@@ -559,6 +563,15 @@ class App:
         except queue.Full:
             shutil.rmtree(jobdir, ignore_errors=True)
 
+    def status(self):
+        now = time.time()
+        parts = []
+        for login, rec in list(self.recorders.items()):
+            with self.lock:
+                n = sum(1 for t in self.stamps.get(login, ()) if t >= now - 60)
+            parts.append(f"{login} cache={rec.count()}seg chat={n}/60s")
+        log("ETAT:", " | ".join(parts) if parts else "aucun stream", f"| clips={self.clips}")
+
     # -- file d'attente
     def worker(self):
         while not (self.stop.is_set() and self.jobs.empty()):
@@ -618,6 +631,8 @@ class App:
                 if not streams:
                     log("aucun live FR sur la categorie pour l'instant")
                 self.sync(streams)
+                time.sleep(20)
+                self.status()
             except Exception as e:
                 log("twitch: erreur", type(e).__name__)
             time.sleep(REFRESH if self.recorders else 60)
