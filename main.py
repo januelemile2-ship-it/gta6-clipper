@@ -65,6 +65,7 @@ AUDIO_DB = _f("AUDIO_DB", 6.0)                # saut de volume (dB) = moment for
 VIS_RATIO = _f("VIS_RATIO", 2.0)              # activite a l'ecran x fois la normale
 VIS_MIN = _f("VIS_MIN", 0.05)                 # activite visuelle minimale
 CROP_X = _f("CROP_X", 0.5)                    # cadrage vertical : 0 gauche, 0.5 centre, 1 droite
+WARMUP = _i("WARMUP", 300)                    # on ignore un stream pendant ses 5 premieres minutes
 COOLDOWN = _i("COOLDOWN", 240)                # pause par streamer (s)
 MAX_CLIPS_PER_RUN = _i("MAX_CLIPS_PER_RUN", 12)
 REFRESH = _i("REFRESH", 120)                  # rafraichit la liste des lives
@@ -493,7 +494,7 @@ class Recorder(threading.Thread):
     def signals(self):
         """(saut de volume en dB, rapport d'activite visuelle, activite recente)"""
         m = list(self.metrics)
-        if len(m) < 8:
+        if len(m) < 20:                      # ~80 s de reference minimum
             return None, None, 0.0
         recent, base = m[-2:], m[-32:-2]
         vol_r = sum(x[0] for x in recent) / len(recent)
@@ -741,6 +742,7 @@ class App:
         self.first_seen = {}
         self.last_clip = {}
         self.clips = 0
+        self.t0 = time.time()
         self.jobs = queue.Queue(maxsize=30)
         self.stop = threading.Event()
         self.lock = threading.Lock()
@@ -765,18 +767,19 @@ class App:
         rec = self.recorders.get(login)
         if not rec or not rec.ready():
             return
-        if now - self.first_seen.get(login, now) < 90:
+        if now - self.first_seen.get(login, now) < WARMUP:
             return
         if now - self.last_clip.get(login, 0) < COOLDOWN:
             return
-        if self.clips >= MAX_CLIPS_PER_RUN or self.jobs.qsize() >= 25:
+        budget = 3 + int((now - self.t0) / (RUN_SECONDS / max(MAX_CLIPS_PER_RUN - 3, 1)))
+        if self.clips >= min(MAX_CLIPS_PER_RUN, budget) or self.jobs.qsize() >= 25:
             return
         aj, vr, mot = rec.signals()
         chat_hit = recent >= MIN_MSGS and recent / WINDOW >= RATIO * max(base_rate, 0.3)
         audio_hit = aj is not None and aj >= AUDIO_DB
         visual_hit = vr is not None and vr >= VIS_RATIO and mot >= VIS_MIN
         score = chat_hit + audio_hit + visual_hit
-        strong = (chat_hit and recent >= 2.5 * MIN_MSGS) or (aj is not None and aj >= AUDIO_DB + 6)
+        strong = chat_hit and recent >= 2.5 * MIN_MSGS
         if score < 2 and not strong:
             return
         reasons = [n for n, hit in (("chat", chat_hit), ("audio", audio_hit), ("visuel", visual_hit)) if hit]
@@ -869,6 +872,7 @@ class App:
         tg_text("🚀 Clipper GTA 6 démarré. Les clips arriveront ici.")
 
         start = time.time()
+        self.t0 = start
         gid = None
         while time.time() - start < RUN_SECONDS:
             try:
