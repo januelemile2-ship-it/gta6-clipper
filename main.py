@@ -52,7 +52,14 @@ TT_REFRESH_TOKEN = os.environ.get("TT_REFRESH_TOKEN", "")
 GAME_NAME = os.environ.get("GAME_NAME", "Grand Theft Auto VI")
 LANGUAGE = os.environ.get("STREAM_LANGUAGE", "fr")
 
-MAX_STREAMS = _i("MAX_STREAMS", 8)            # streams surveilles en meme temps
+MAX_STREAMS = _i("MAX_STREAMS", 16)           # lives surveilles en meme temps
+HQ_STREAMS = _i("HQ_STREAMS", 6)              # les N plus gros sont captes en 1080p, les autres en 720p
+SWAP_RATIO = _f("SWAP_RATIO", 1.25)           # un live doit avoir 25 % de viewers en plus pour en remplacer un autre
+ANALYZE_EVERY = _i("ANALYZE_EVERY", 2)        # analyse du son/image 1 segment sur N (economise le processeur)
+VIP = {x.strip().lower() for x in os.environ.get("VIP_STREAMERS", "").split(",") if x.strip()}
+IGNORE = {x.strip().lower() for x in os.environ.get("IGNORE_STREAMERS", "").split(",") if x.strip()}
+Q_HQ = "1080p60,1080p,720p60,720p,480p,best"
+Q_STD = "720p60,720p,480p,best"
 SEG_LEN = 4                                   # secondes par segment de cache
 KEEP_SEGMENTS = 24                            # 24 x 4 s = 96 s de cache
 CLIP_SECONDS = _i("CLIP_SECONDS", 76)         # duree du clip (> 1 minute)
@@ -67,12 +74,48 @@ VIS_MIN = _f("VIS_MIN", 0.05)                 # activite visuelle minimale
 CROP_X = _f("CROP_X", 0.5)                    # cadrage vertical : 0 gauche, 0.5 centre, 1 droite
 WARMUP = _i("WARMUP", 300)                    # on ignore un stream pendant ses 5 premieres minutes
 COOLDOWN = _i("COOLDOWN", 240)                # pause par streamer (s)
-MAX_CLIPS_PER_RUN = _i("MAX_CLIPS_PER_RUN", 12)
+MAX_CLIPS_PER_RUN = _i("MAX_CLIPS_PER_RUN", 6)     # 6 x 4 tranches = ~24 clips par jour max
+BURST = _i("BURST", 2)                        # clips autorises d'entree, le reste est reparti sur la tranche
+MIN_SCORE = _f("MIN_SCORE", 2.5)              # score minimum (chat + son + image) pour clipper
 REFRESH = _i("REFRESH", 120)                  # rafraichit la liste des lives
 RUN_SECONDS = _i("RUN_SECONDS", 20700)        # 5 h 45 puis relais auto
 DRAIN_SECONDS = _i("DRAIN_SECONDS", 480)      # temps max pour finir la file
 ENABLE_SUBS = os.environ.get("ENABLE_SUBS", "1") == "1"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+
+# ---- reglages du montage (tout est modifiable depuis le fichier clipper.yml) ----
+LAYOUT = os.environ.get("LAYOUT", "fill")             # fill = plein ecran zoome | blur = image entiere + fond flou
+AUTO_CROP = os.environ.get("AUTO_CROP", "1") == "1"   # cadrage automatique sur la zone d'action
+CROP_MIN = _f("CROP_MIN", 0.30)                       # le cadrage reste entre ces deux positions
+CROP_MAX = _f("CROP_MAX", 0.70)
+ZOOM_END = _f("ZOOM_END", 0.07)                       # zoom lent sur toute la duree (7 %)
+PUNCH = _f("PUNCH", 0.10)                             # effet "coup de zoom" des 0,45 premieres secondes
+SHARPEN = _f("SHARPEN", 0.7)                          # nettete (0 = aucune)
+SATURATION = _f("SATURATION", 1.12)                   # couleurs
+CONTRAST = _f("CONTRAST", 1.05)
+BRIGHTNESS = _f("BRIGHTNESS", 0.0)
+VIGNETTE = os.environ.get("VIGNETTE", "1") == "1"     # leger assombrissement des bords
+HOOK_SECONDS = _f("HOOK_SECONDS", 3.5)                # duree du titre d'accroche
+HOOK_SIZE = _i("HOOK_SIZE", 72)
+HOOK_Y = _i("HOOK_Y", 230)
+CREDIT = os.environ.get("CREDIT", "1") == "1"         # mention "via twitch.tv/streamer"
+SUB_WORDS = _i("SUB_WORDS", 3)                        # mots par ligne de sous-titre
+SUB_SIZE = _i("SUB_SIZE", 66)
+SUB_MARGIN = _i("SUB_MARGIN", 420)                    # hauteur des sous-titres depuis le bas
+OUTRO_SECONDS = _f("OUTRO_SECONDS", 3.0)
+CHANNEL_TAG = os.environ.get("CHANNEL_TAG", "")       # ex: @tachaine, affiche sur l'ecran de fin
+CRF = _i("QUALITY_CRF", 19)                           # qualite video (plus bas = meilleur, 17-23)
+PRESET = os.environ.get("X264_PRESET", "fast")
+MAXRATE = os.environ.get("VIDEO_MAXRATE", "9M")
+AUDIO_KBPS = _i("AUDIO_KBPS", 192)
+LUFS = _f("LUFS", -14)                                # volume final (standard shorts/tiktok)
+TRUE_PEAK = _f("TRUE_PEAK", -1.5)
+COMP_RATIO = _f("COMP_RATIO", 3.0)                    # compression de la voix et du jeu
+EQ_PRESENCE = _f("EQ_PRESENCE", 2.0)                  # dB de "presence" ajoutes vers 3,5 kHz
+HIGHPASS = _i("HIGHPASS", 60)                         # coupe les graves parasites (Hz)
+SFX = os.environ.get("SFX", "1") == "1"               # sound design (whoosh, impact, ding)
+SFX_VOL = _f("SFX_VOL", 1.0)
+MIN_MEAN_DB = _f("MIN_MEAN_DB", -42)                  # en dessous : clip quasi muet, ignore
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 ROOT = os.path.abspath("work")
@@ -178,61 +221,107 @@ def yt_enabled():
     return bool(YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN)
 
 
-def yt_upload(path, title, description):
-    """Depose le clip sur ta chaine. 'private' tant que l'audit YouTube n'est pas passe."""
+YT_HINTS = {
+    "uploadLimitExceeded": "limite d'envois atteinte pour ta chaine (verifie-la par telephone sur youtube.com/verify, ou attends 24 h)",
+    "quotaExceeded": "quota quotidien de l'API atteint, ca repart demain",
+    "dailyLimitExceeded": "quota quotidien de l'API atteint, ca repart demain",
+    "invalid_grant": "cle d'acces expiree ou revoquee : il faut refaire le refresh token",
+    "invalid_client": "ID client ou code secret incorrect dans les secrets GitHub",
+    "youtubeSignupRequired": "aucune chaine YouTube liee a ce compte Google",
+    "forbidden": "acces refuse par YouTube",
+    "authError": "autorisation refusee, refaire le refresh token",
+}
+
+
+class YTError(Exception):
+    def __init__(self, status, reason, msg=""):
+        super().__init__(reason)
+        self.status, self.reason, self.msg = status, reason, msg
+
+
+def _yt_fail(resp):
+    reason, msg = "inconnue", ""
     try:
-        t = requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": YT_CLIENT_ID,
-                "client_secret": YT_CLIENT_SECRET,
-                "refresh_token": YT_REFRESH_TOKEN,
-                "grant_type": "refresh_token",
-            },
-            timeout=30,
+        j = resp.json()
+        e = j.get("error")
+        if isinstance(e, dict):
+            reason = ((e.get("errors") or [{}])[0].get("reason")) or e.get("status") or "inconnue"
+            msg = e.get("message", "")
+        elif e:
+            reason, msg = str(e), j.get("error_description", "")
+    except Exception:
+        msg = resp.text[:120]
+    raise YTError(resp.status_code, reason, msg)
+
+
+def _yt_once(path, title, description):
+    t = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": YT_CLIENT_ID,
+            "client_secret": YT_CLIENT_SECRET,
+            "refresh_token": YT_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    if t.status_code != 200:
+        _yt_fail(t)
+    access = t.json()["access_token"]
+    meta = {
+        "snippet": {
+            "title": title[:95],
+            "description": description[:4900],
+            "tags": ["GTA6", "GTAVI", "Shorts", "Gaming"],
+            "categoryId": "20",
+        },
+        "status": {"privacyStatus": YT_PRIVACY, "selfDeclaredMadeForKids": False},
+    }
+    size = os.path.getsize(path)
+    init = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos"
+        "?uploadType=resumable&part=snippet,status",
+        headers={
+            "Authorization": "Bearer " + access,
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Length": str(size),
+            "X-Upload-Content-Type": "video/mp4",
+        },
+        json=meta,
+        timeout=60,
+    )
+    if init.status_code != 200:
+        _yt_fail(init)
+    with open(path, "rb") as f:
+        up = requests.put(
+            init.headers["Location"],
+            data=f,
+            headers={"Content-Length": str(size), "Content-Type": "video/mp4"},
+            timeout=1800,
         )
-        t.raise_for_status()
-        access = t.json()["access_token"]
-        meta = {
-            "snippet": {
-                "title": title[:95],
-                "description": description[:4900],
-                "tags": ["GTA6", "GTAVI", "Shorts", "Gaming"],
-                "categoryId": "20",
-            },
-            "status": {
-                "privacyStatus": YT_PRIVACY,
-                "selfDeclaredMadeForKids": False,
-            },
-        }
-        size = os.path.getsize(path)
-        init = requests.post(
-            "https://www.googleapis.com/upload/youtube/v3/videos"
-            "?uploadType=resumable&part=snippet,status",
-            headers={
-                "Authorization": "Bearer " + access,
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Length": str(size),
-                "X-Upload-Content-Type": "video/mp4",
-            },
-            json=meta,
-            timeout=60,
-        )
-        init.raise_for_status()
-        with open(path, "rb") as f:
-            up = requests.put(
-                init.headers["Location"],
-                data=f,
-                headers={"Content-Length": str(size), "Content-Type": "video/mp4"},
-                timeout=900,
-            )
-        up.raise_for_status()
-        return "https://youtube.com/shorts/" + up.json()["id"]
-    except requests.HTTPError as e:
-        log("youtube: erreur", e.response.status_code, e.response.text[:200])
-    except Exception as e:
-        log("youtube: erreur", type(e).__name__)
-    return None
+    if up.status_code not in (200, 201):
+        _yt_fail(up)
+    return "https://youtube.com/shorts/" + up.json()["id"]
+
+
+def yt_upload(path, title, description):
+    """Depose le clip sur ta chaine ('private' tant que l'audit YouTube n'est pas passe).
+    Renvoie (lien, None) ou (None, explication de l'echec)."""
+    last = "erreur reseau"
+    for attempt in range(3):
+        try:
+            return _yt_once(path, title, description), None
+        except YTError as e:
+            hint = YT_HINTS.get(e.reason, e.msg[:140])
+            last = f"{e.reason} (HTTP {e.status})" + (f" - {hint}" if hint else "")
+            log("youtube: erreur", e.status, e.reason, e.msg[:120])
+            if e.status < 500:
+                break                      # inutile de reessayer une erreur de configuration
+        except Exception as e:
+            last = f"probleme reseau ({type(e).__name__})"
+            log("youtube: erreur", type(e).__name__)
+        time.sleep(20)
+    return None, last
 
 
 # ------------------------------------------------------------------- tiktok
@@ -429,9 +518,11 @@ class Chat(threading.Thread):
 
 # ----------------------------------------------------- cache video (rolling)
 class Recorder(threading.Thread):
-    def __init__(self, login):
+    def __init__(self, login, hq=True):
         super().__init__(daemon=True)
         self.login = login
+        self.hq = hq
+        self.protect_until = 0.0
         self.dir = os.path.join(BUF_DIR, login)
         self.stop_evt = threading.Event()
         self.procs = []
@@ -466,7 +557,7 @@ class Recorder(threading.Thread):
     @staticmethod
     def analyze_segment(path):
         r = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+            ["nice", "-n", "10", "ffmpeg", "-hide_banner", "-nostats", "-threads", "1", "-i", path,
              "-vf", "fps=4,scale=160:90,select='gte(scene,0)',metadata=print:file=-",
              "-af", "volumedetect", "-f", "null", "-"],
             capture_output=True, text=True, timeout=60,
@@ -481,10 +572,17 @@ class Recorder(threading.Thread):
         while not self.stop_evt.is_set():
             try:
                 done = self._segments()[:-1]      # le dernier est en cours d'ecriture
-                for f in done[-4:]:
-                    if f not in self.analyzed:
-                        self.analyzed.add(f)
-                        self.metrics.append(self.analyze_segment(f))
+                for f in done[-6:]:
+                    if f in self.analyzed:
+                        continue
+                    self.analyzed.add(f)
+                    try:
+                        idx = int(os.path.basename(f)[4:10])
+                    except ValueError:
+                        idx = 0
+                    if idx % ANALYZE_EVERY:
+                        continue
+                    self.metrics.append(self.analyze_segment(f))
                 if len(self.analyzed) > 200:
                     self.analyzed = set(done)
             except Exception as e:
@@ -515,7 +613,7 @@ class Recorder(threading.Thread):
                     [
                         "streamlink", "--loglevel", "none", "--stdout",
                         f"https://twitch.tv/{self.login}",
-                        "720p60,720p,480p,best",
+                        Q_HQ if self.hq else Q_STD,
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
@@ -546,6 +644,7 @@ class Recorder(threading.Thread):
                 log("cache: erreur", self.login, type(e).__name__)
             if not self.stop_evt.is_set():
                 time.sleep(10)
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def snapshot(self, seconds):
         """Copie immediatement les derniers `seconds` secondes du cache."""
@@ -576,47 +675,6 @@ class Recorder(threading.Thread):
 _wm = None
 
 
-def srt_time(t):
-    ms = int(round(t * 1000))
-    h, ms = divmod(ms, 3600000)
-    m, ms = divmod(ms, 60000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def make_subs(jobdir):
-    """Sous-titres automatiques (faster-whisper, gratuit, sur CPU)."""
-    global _wm
-    try:
-        from faster_whisper import WhisperModel
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", "raw.ts", "-vn",
-             "-ac", "1", "-ar", "16000", "audio.wav"],
-            cwd=jobdir, check=True, timeout=120,
-        )
-        if _wm is None:
-            _wm = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segs, _ = _wm.transcribe(
-            os.path.join(jobdir, "audio.wav"),
-            language="fr", vad_filter=True, beam_size=1,
-        )
-        blocks, i = [], 1
-        for s in segs:
-            t = s.text.strip()
-            if t:
-                blocks.append(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{t}\n")
-                i += 1
-        if not blocks:
-            return False
-        with open(os.path.join(jobdir, "clip.srt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(blocks))
-        return True
-    except Exception as e:
-        log("sous-titres ignores:", type(e).__name__)
-        return False
-
-
 def clean_name(n):
     return re.sub(r"[^\w\- ]", "", n)[:20].strip() or "Ce streamer"
 
@@ -634,96 +692,313 @@ def make_title(display, reasons=()):
     return base, f"{random.choice(EMOJIS)} {base}"
 
 
-def render(jobdir, screen_title, with_subs):
-    with open(os.path.join(jobdir, "title.txt"), "w", encoding="utf-8") as f:
-        f.write(textwrap.fill(screen_title.upper(), 20))
-
+def probe_duration(jobdir, name="raw.ts"):
     try:
-        dur = float(subprocess.run(
+        return float(subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", "raw.ts"],
+             "-of", "csv=p=0", name],
             cwd=jobdir, capture_output=True, text=True, timeout=30,
         ).stdout.strip())
     except Exception:
-        dur = float(CLIP_SECONDS)
-    dur = max(dur, 5.0)
+        return float(CLIP_SECONDS)
 
-    subs = ""
-    if with_subs:
-        subs = (
-            ",subtitles=clip.srt:original_size=1080x1920:"
-            "fontsdir=/usr/share/fonts/truetype/dejavu:force_style="
-            "'FontName=DejaVu Sans,FontSize=9,Bold=1,Outline=1.2,Alignment=2,"
-            "MarginV=60,PrimaryColour=&H0000FFFF'"
+
+def qc(jobdir):
+    """Controle qualite : on ignore un clip quasi muet."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", "raw.ts", "-vn",
+             "-af", "volumedetect", "-f", "null", "-"],
+            cwd=jobdir, capture_output=True, text=True, timeout=120,
+        )
+        m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", r.stderr)
+        return (float(m.group(1)) if m else -91.0) >= MIN_MEAN_DB
+    except Exception:
+        return True
+
+
+def auto_crop_x(jobdir):
+    """Position horizontale du cadrage 9:16, calee sur la zone ou il y a le plus d'action."""
+    if not AUTO_CROP:
+        return CROP_X
+    try:
+        w, h = 96, 54
+        fs = w * h
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", "raw.ts", "-an",
+             "-vf", f"fps=4,scale={w}:{h},format=gray", "-f", "rawvideo", "-"],
+            cwd=jobdir, capture_output=True, timeout=180,
+        )
+        data = r.stdout
+        n = len(data) // fs
+        if n < 10:
+            return CROP_X
+        cols = [0.0] * w
+        prev = data[0:fs]
+        for i in range(1, n):
+            cur = data[i * fs:(i + 1) * fs]
+            for idx, (a, b) in enumerate(zip(cur, prev)):
+                d = a - b if a > b else b - a
+                if d > 12:
+                    cols[idx % w] += d
+            prev = cur
+        total = sum(cols)
+        if total <= 0:
+            return CROP_X
+        cx = sum(x * c for x, c in enumerate(cols)) / total / (w - 1)
+        cx = 0.35 * 0.5 + 0.65 * cx           # on reste prudent : melange avec le centre
+        return max(CROP_MIN, min(CROP_MAX, cx))
+    except Exception as e:
+        log("cadrage auto ignore:", type(e).__name__)
+        return CROP_X
+
+
+def ass_time(t):
+    cs = int(round(t * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s_, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{s_:02d}.{cs:02d}"
+
+
+def make_subs(jobdir):
+    """Sous-titres animes mot par mot (faster-whisper, gratuit, sur CPU)."""
+    global _wm
+    try:
+        from faster_whisper import WhisperModel
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", "raw.ts", "-vn",
+             "-ac", "1", "-ar", "16000", "audio.wav"],
+            cwd=jobdir, check=True, timeout=120,
+        )
+        if _wm is None:
+            _wm = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segs, _ = _wm.transcribe(
+            os.path.join(jobdir, "audio.wav"),
+            language="fr", vad_filter=True, beam_size=1, word_timestamps=True,
+            condition_on_previous_text=False,
+            initial_prompt="Streamers francais qui jouent a GTA 6, Vice City, Leonida, Lucia, Jason.",
+        )
+        words = []
+        for sg in segs:
+            for w in (sg.words or []):
+                t = w.word.strip()
+                if t:
+                    words.append((w.start, w.end, t.upper()))
+        if not words:
+            return False
+        lines, cur = [], []
+        for w in words:
+            if cur and (len(cur) >= SUB_WORDS or w[0] - cur[-1][1] > 0.8):
+                lines.append(cur)
+                cur = []
+            cur.append(w)
+        if cur:
+            lines.append(cur)
+        ev = []
+        for ln in lines:
+            txt = ""
+            for i, (st, en, t) in enumerate(ln):
+                nxt = ln[i + 1][0] if i + 1 < len(ln) else en
+                txt += "{\\kf%d}%s " % (max(int(round((nxt - st) * 100)), 1), t)
+            ev.append(
+                f"Dialogue: 0,{ass_time(ln[0][0])},{ass_time(ln[-1][1] + 0.2)},Main,,0,0,0,,{txt.strip()}"
+            )
+        head = (
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n"
+            "WrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+            "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+            f"Style: Main,DejaVu Sans,{SUB_SIZE},&H0000E6FF,&H00FFFFFF,&H00000000,&H64000000,"
+            f"-1,0,0,0,100,100,0,0,1,6,2,2,70,70,{SUB_MARGIN},1\n\n"
+            "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+        )
+        with open(os.path.join(jobdir, "clip.ass"), "w", encoding="utf-8") as f:
+            f.write(head + "\n".join(ev) + "\n")
+        return True
+    except Exception as e:
+        log("sous-titres ignores:", type(e).__name__)
+        return False
+
+
+def render(jobdir, screen_title, with_subs, cx, login):
+    with open(os.path.join(jobdir, "title.txt"), "w", encoding="utf-8") as f:
+        f.write(textwrap.fill(screen_title.upper(), 20))
+    with open(os.path.join(jobdir, "credit.txt"), "w", encoding="utf-8") as f:
+        f.write(f"via twitch.tv/{login}")
+
+    D = max(probe_duration(jobdir), 5.0)
+    O = OUTRO_SECONDS
+    H = HOOK_SECONDS
+
+    grade = (
+        f"eq=contrast={CONTRAST}:saturation={SATURATION}:brightness={BRIGHTNESS},"
+        f"unsharp=5:5:{SHARPEN}:5:5:0.0"
+        + (",vignette=angle=PI/5" if VIGNETTE else "")
+    )
+
+    if LAYOUT == "blur":
+        base = (
+            "[0:v]setpts=PTS-STARTPTS,split=2[bg][fg];"
+            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,boxblur=25:3,eq=brightness=-0.05[bgb];"
+            "[fg]scale=1080:-2:flags=lanczos[fgs];"
+            f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps=30,setsar=1,{grade}"
+        )
+    else:
+        zoom = f"1+{ZOOM_END}*min(t/{D:.2f},1)+{PUNCH}*max(0,1-t/0.45)"
+        base = (
+            "[0:v]setpts=PTS-STARTPTS,"
+            f"crop=w='min(iw,ih*9/16)':h=ih:x='(iw-ow)*{cx:.3f}':y=0,"
+            "scale=1080:1920:flags=lanczos,"
+            f"scale=w='trunc(1080*({zoom})/2)*2':h=-2:eval=frame:flags=bicubic,"
+            f"crop=1080:1920,fps=30,setsar=1,{grade}"
         )
 
-    # plein cadre : on decoupe la partie centrale de l'image en 9:16 et on zoome
-    fg = (
-        "[0:v]setpts=PTS-STARTPTS,"
-        f"crop=w='min(iw,ih*9/16)':h=ih:x='(iw-ow)*{CROP_X}':y=0,"
-        "scale=1080:1920:flags=lanczos,fps=30,setsar=1,"
-        f"drawtext=fontfile={FONT}:textfile=title.txt:expansion=none:fontsize=70:"
-        "fontcolor=yellow:borderw=5:bordercolor=black:line_spacing=12:"
-        "box=1:boxcolor=black@0.45:boxborderw=22:"
-        "x=(w-text_w)/2:y=230:enable='between(t,0,4)'"
-        f"{subs},format=yuv420p[v0a];"
-        # barre de progression jaune en bas (retient l'attention)
-        "[v0a][3:v]overlay=x='-w+w*t/" + f"{dur:.2f}" + "':y=H-16:shortest=1[v0];"
-        "[1:v]drawbox=x=150:y=980:w=780:h=170:color=0xFF0000@0.95:t=fill,"
+    hook = (
+        f",drawtext=fontfile={FONT}:textfile=title.txt:expansion=none:fontsize={HOOK_SIZE}:"
+        "fontcolor=yellow:borderw=6:bordercolor=black:line_spacing=14:"
+        "box=1:boxcolor=black@0.45:boxborderw=24:x=(w-text_w)/2:"
+        f"y='{HOOK_Y}+if(lt(t,0.3),-(0.3-t)*400,0)':"
+        f"alpha='if(lt(t,0.3),t/0.3,if(gt(t,{H}-0.4),({H}-t)/0.4,1))':"
+        f"enable='between(t,0,{H})'"
+    )
+    credit = ""
+    if CREDIT:
+        credit = (
+            f",drawtext=fontfile={FONT}:textfile=credit.txt:expansion=none:fontsize=38:"
+            "fontcolor=white@0.9:borderw=4:bordercolor=black:x=(w-text_w)/2:y=h-170:"
+            "enable='between(t,0.5,6)'"
+        )
+    subs = ""
+    if with_subs:
+        subs = ",ass=clip.ass:fontsdir=/usr/share/fonts/truetype/dejavu"
+
+    tag = ""
+    if CHANNEL_TAG:
+        with open(os.path.join(jobdir, "tag.txt"), "w", encoding="utf-8") as f:
+            f.write(CHANNEL_TAG)
+        tag = (
+            f",drawtext=fontfile={FONT}:textfile=tag.txt:expansion=none:fontsize=60:"
+            "fontcolor=white:x=(w-text_w)/2:y=1500"
+        )
+
+    v = (
+        f"{base}{hook}{credit}{subs},format=yuv420p[v0a];"
+        f"[v0a][2:v]overlay=x='-w+w*t/{D:.2f}':y=H-16:shortest=1[v0];"
+        # ecran de fin : degrade anime + bouton qui pulse
+        "[1:v]format=gbrp,geq=r='22+34*Y/H':g='18+22*Y/H':b='38+70*Y/H',format=yuv420p,"
+        "drawbox=x=150:y=980:w=780:h=170:color=0xFF0000@0.95:t=fill,"
         f"drawtext=fontfile={FONT}:text=ABONNE-TOI:fontsize=86:fontcolor=white:"
         "x=(w-text_w)/2:y=1025+10*sin(2*PI*t*3),"
         f"drawtext=fontfile={FONT}:text=pour ne rater aucun des moments:fontsize=50:"
         "fontcolor=white:x=(w-text_w)/2:y=1260:alpha='0.7+0.3*sin(2*PI*t*2)',"
         f"drawtext=fontfile={FONT}:text=les plus fous du jeu vidéo:fontsize=50:"
-        "fontcolor=yellow:x=(w-text_w)/2:y=1335:alpha='0.7+0.3*sin(2*PI*t*2)',"
-        "fade=t=in:st=0:d=0.4,fps=30,setsar=1,format=yuv420p[v1];"
-        "[0:a]asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-1.5:LRA=11,"
-        "aresample=44100,aformat=channel_layouts=stereo[a0];"
-        "[2:a]aformat=channel_layouts=stereo[a1];"
-        "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+        "fontcolor=yellow:x=(w-text_w)/2:y=1335:alpha='0.7+0.3*sin(2*PI*t*2)'"
+        f"{tag},fade=t=in:st=0:d=0.4,fps=30,setsar=1,format=yuv420p[v1];"
     )
+
+    sv = SFX_VOL if SFX else 0.0
+    a = (
+        "[0:a]asetpts=PTS-STARTPTS,"
+        f"highpass=f={HIGHPASS},"
+        f"acompressor=threshold=0.125:ratio={COMP_RATIO}:attack=5:release=80:makeup=2,"
+        f"equalizer=f=3500:t=q:w=1:g={EQ_PRESENCE},"
+        f"loudnorm=I={LUFS}:TP={TRUE_PEAK}:LRA=9,"
+        "aresample=48000,aformat=channel_layouts=stereo[am];"
+    )
+    if SFX:
+        a += (
+            f"[3:a]highpass=f=700,lowpass=f=7000,afade=t=in:d=0.4,afade=t=out:st=0.4:d=0.4,"
+            f"volume={0.35 * sv:.3f},aformat=channel_layouts=stereo[wh];"
+            f"[4:a]afade=t=out:st=0.05:d=0.8,volume={0.9 * sv:.3f},aformat=channel_layouts=stereo[bo];"
+            f"[5:a]lowpass=f=180,afade=t=out:st=0:d=0.9,volume={0.5 * sv:.3f},aformat=channel_layouts=stereo[bn];"
+            "[am][wh][bo][bn]amix=inputs=4:duration=first:normalize=0,alimiter=limit=0.95[a0];"
+            f"[6:a]afade=t=out:st=0.05:d=0.65,volume={0.25 * sv:.3f}[d1];"
+            f"[7:a]afade=t=out:st=0.05:d=0.5,volume={0.12 * sv:.3f}[d2];"
+            f"[d1][d2]amix=inputs=2:normalize=0,adelay=300|300,apad=whole_dur={O},"
+            f"atrim=0:{O},aformat=channel_layouts=stereo[a1];"
+        )
+    else:
+        a += (
+            "[am]alimiter=limit=0.95[a0];"
+            f"[6:a]volume=0,apad=whole_dur={O},atrim=0:{O},aformat=channel_layouts=stereo[a1];"
+        )
+    fg = v + a + "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", "raw.ts",
-        "-f", "lavfi", "-t", "3", "-i", "color=c=0x14141e:s=1080x1920:r=30",
-        "-f", "lavfi", "-t", "3", "-i", "anullsrc=r=44100:cl=stereo",
-        "-f", "lavfi", "-t", f"{dur + 1:.2f}", "-i", "color=c=yellow:s=1080x14:r=30",
+        "-f", "lavfi", "-t", f"{O}", "-i", "color=c=0x14141e:s=1080x1920:r=30",
+        "-f", "lavfi", "-t", f"{D + 1:.2f}", "-i", "color=c=yellow:s=1080x14:r=30",
+        "-f", "lavfi", "-t", "0.8", "-i", "anoisesrc=d=0.8:c=pink:a=0.5:r=48000",
+        "-f", "lavfi", "-t", "0.9", "-i", "sine=f=52:d=0.9:r=48000",
+        "-f", "lavfi", "-t", "0.9", "-i", "anoisesrc=d=0.9:c=brown:a=0.6:r=48000",
+        "-f", "lavfi", "-t", "0.7", "-i", "sine=f=1318:d=0.7:r=48000",
+        "-f", "lavfi", "-t", "0.7", "-i", "sine=f=1975:d=0.7:r=48000",
         "-filter_complex", fg,
         "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-        "-maxrate", "4M", "-bufsize", "8M",
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF),
+        "-maxrate", MAXRATE, "-bufsize", "18M", "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+        "-c:a", "aac", "-b:a", f"{AUDIO_KBPS}k", "-ar", "48000",
         "-movflags", "+faststart",
         "final.mp4",
     ]
-    subprocess.run(cmd, cwd=jobdir, check=True, timeout=900)
+    subprocess.run(cmd, cwd=jobdir, check=True, timeout=1500)
     return os.path.join(jobdir, "final.mp4")
 
 
+def tg_version(jobdir, path):
+    """Version allegee pour Telegram (limite 50 Mo) ; YouTube recoit la version haute qualite."""
+    if os.path.getsize(path) <= 45 * 1024 * 1024:
+        return path
+    out = os.path.join(jobdir, "tg.mp4")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+         "-maxrate", "3M", "-bufsize", "6M",
+         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out],
+        check=True, timeout=600,
+    )
+    return out
+
+
 def process(jobdir, login, display, reasons=()):
+    if not qc(jobdir):
+        log("clip ignore (son quasi absent):", login)
+        return
     screen_title, caption_title = make_title(display, reasons)
+    cx = auto_crop_x(jobdir)
     with_subs = ENABLE_SUBS and make_subs(jobdir)
     try:
-        out = render(jobdir, screen_title, with_subs)
+        out = render(jobdir, screen_title, with_subs, cx, login)
     except subprocess.CalledProcessError:
         if not with_subs:
             raise
         log("montage: nouvel essai sans sous-titres")
-        out = render(jobdir, screen_title, False)
+        out = render(jobdir, screen_title, False, cx, login)
     caption = (
         f"{caption_title}\n\n"
         f"Clip du live de {display} (twitch.tv/{login}). "
         f"Abonne-toi pour ne rater aucun des moments les plus fous du jeu vidéo !\n\n{HASHTAGS}"
     )
-    ok = tg_video(out, caption)
+    try:
+        tg_path = tg_version(jobdir, out)
+    except Exception:
+        tg_path = out
+    ok = tg_video(tg_path, caption)
     log("clip envoye" if ok else "clip NON envoye", login)
     if yt_enabled():
-        link = yt_upload(out, f"{caption_title} #Shorts", caption)
+        link, err = yt_upload(out, f"{caption_title} #Shorts", caption)
         if link:
             log("youtube: depose", YT_PRIVACY)
             tg_text(f"▶️ YouTube ({YT_PRIVACY}) : {link}")
         else:
-            tg_text("⚠️ Dépôt YouTube échoué, voir les logs GitHub.")
+            tg_text(f"⚠️ Dépôt YouTube échoué : {err}")
     if tt_enabled():
         if tt_upload(out):
             log("tiktok: brouillon envoye")
@@ -771,7 +1046,7 @@ class App:
             return
         if now - self.last_clip.get(login, 0) < COOLDOWN:
             return
-        budget = 3 + int((now - self.t0) / (RUN_SECONDS / max(MAX_CLIPS_PER_RUN - 3, 1)))
+        budget = BURST + int((now - self.t0) / (RUN_SECONDS / max(MAX_CLIPS_PER_RUN - BURST, 1)))
         if self.clips >= min(MAX_CLIPS_PER_RUN, budget) or self.jobs.qsize() >= 25:
             return
         aj, vr, mot = rec.signals()
@@ -780,14 +1055,19 @@ class App:
         visual_hit = vr is not None and vr >= VIS_RATIO and mot >= VIS_MIN
         score = chat_hit + audio_hit + visual_hit
         strong = chat_hit and recent >= 2.5 * MIN_MSGS
-        if score < 2 and not strong:
+        ratio = (recent / WINDOW) / max(base_rate, 0.3)
+        q = (min(ratio / RATIO, 3) if recent >= MIN_MSGS else 0.0)
+        q += min(max(aj, 0) / AUDIO_DB, 3) if aj is not None else 0.0
+        q += min(vr / VIS_RATIO, 3) if (vr is not None and mot >= VIS_MIN) else 0.0
+        if (score < 2 and not strong) or q < MIN_SCORE:
             return
         reasons = [n for n, hit in (("chat", chat_hit), ("audio", audio_hit), ("visuel", visual_hit)) if hit]
         self.last_clip[login] = now
+        rec.protect_until = now + POST_DELAY + 90
         log(
             f"PIC detecte sur {login} ({'+'.join(reasons) or 'fort'}): chat {recent}/{WINDOW}s "
             f"(normal {base_rate:.2f}/s), son {aj if aj is None else round(aj, 1)} dB, "
-            f"image x{vr if vr is None else round(vr, 1)}"
+            f"image x{vr if vr is None else round(vr, 1)}, score {q:.1f}"
         )
         threading.Timer(POST_DELAY, self.grab, args=(login, reasons)).start()
 
@@ -824,8 +1104,13 @@ class App:
                 n = sum(1 for t in self.stamps.get(login, ()) if t >= now - 60)
             aj, vr, _ = rec.signals()
             sig = "" if aj is None else f" son{aj:+.1f}dB image x{vr:.1f}"
-            parts.append(f"{login} cache={rec.count()}seg chat={n}/60s{sig}")
-        log("ETAT:", " | ".join(parts) if parts else "aucun stream", f"| clips={self.clips}")
+            parts.append(f"{login}{'*' if rec.hq else ''} cache={rec.count()}seg chat={n}/60s{sig}")
+        try:
+            load = f"charge={os.getloadavg()[0]:.1f}"
+        except Exception:
+            load = ""
+        log("ETAT:", " | ".join(parts) if parts else "aucun stream",
+            f"| {len(self.recorders)} lives, clips={self.clips} {load}")
 
     # -- file d'attente
     def worker(self):
@@ -842,23 +1127,52 @@ class App:
                 shutil.rmtree(jobdir, ignore_errors=True)
 
     # -- liste des lives
+    def prio(self, login, live):
+        s = live.get(login)
+        return (s["viewers"] if s else 0) + (10_000_000 if login in VIP else 0)
+
+    def protected(self, login, now):
+        """Un live qu'on vient de lancer ou dont un clip est en cours n'est pas remplacable."""
+        r = self.recorders[login]
+        return now < r.protect_until or now - self.first_seen.get(login, 0) < WARMUP + 60
+
+    def start_rec(self, login, live, hq):
+        r = Recorder(login, hq)
+        r.start()
+        self.recorders[login] = r
+        self.first_seen[login] = time.time()
+        with self.lock:
+            self.stamps.pop(login, None)
+        log(f"surveille: {login} ({live[login]['viewers']} viewers, {'1080p' if hq else '720p'})")
+
     def sync(self, streams):
-        live = {s["login"]: s for s in streams}
+        now = time.time()
+        live = {s["login"]: s for s in streams if s["login"] not in IGNORE}
         for login, s in live.items():
             self.info[login] = (s["name"], s["viewers"])
         for login in list(self.recorders):
             if login not in live:
                 self.recorders.pop(login).stop()
                 log("fin de live:", login)
-        for login in live:        # deja tries par nombre de viewers
-            if len(self.recorders) >= MAX_STREAMS:
-                break
-            if login not in self.recorders:
-                r = Recorder(login)
-                r.start()
-                self.recorders[login] = r
-                self.first_seen[login] = time.time()
-                log(f"surveille: {login} ({live[login]['viewers']} viewers)")
+        ranked = sorted(live, key=lambda l: self.prio(l, live), reverse=True)
+        wanted = ranked[:MAX_STREAMS]
+        for login in wanted:                       # du plus gros au plus petit
+            if login in self.recorders:
+                continue
+            if len(self.recorders) < MAX_STREAMS:
+                hq = sum(1 for r in self.recorders.values() if r.hq) < HQ_STREAMS
+                self.start_rec(login, live, hq)
+                continue
+            cands = [l for l in self.recorders if l not in wanted and not self.protected(l, now)]
+            if not cands:
+                continue
+            weakest = min(cands, key=lambda l: self.prio(l, live))
+            if self.prio(login, live) >= SWAP_RATIO * self.prio(weakest, live):
+                hq = self.recorders[weakest].hq
+                self.recorders.pop(weakest).stop()
+                log(f"remplace {weakest} ({live[weakest]['viewers']} viewers) "
+                    f"par {login} ({live[login]['viewers']} viewers)")
+                self.start_rec(login, live, hq)
         self.chat.set_channels(list(self.recorders))
 
     def run(self):
